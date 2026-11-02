@@ -7,4 +7,4 @@ An automated Python script that fetches weather data and appends it directly to 
 
 ## Session Navigation
 * ⬅️ **Previous Session:** Session 4
-* ➡️ **Next Session:** [Session 6: AI Automation Workflow](https://github.com/zubairjilani-AI/Session6-RepositoryName)
+* ➡️ **Next Session:** [Session 6: Weather Job Automation](https://github.com/zubairjilani-AI/weather-job)
