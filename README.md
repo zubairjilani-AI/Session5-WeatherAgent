@@ -4,7 +4,7 @@ import json
 import requests
 from time import sleep
 
-# ---------- Settings ----------
+# Settings
 CITY = "Karachi"
 CITIES = {
     "Lahore": (31.52, 74.32),
@@ -18,7 +18,7 @@ MODEL = "llama-3.1-8b-instant"
 os.environ["GROQ_API_KEY"] = "gsk_hcucpija4asOfL3fXpv4WGdyb3FYbWFLM2ZsDczN5HZyVXVMMbp"
 os.environ["SHEET_URL"] = "https://google.com"
 
-# ---------- 1. Get weather data ----------
+# 1. Get weather data
 def get_weather(city):
     lat, lon = CITIES[city]
     url = (
@@ -44,7 +44,7 @@ def get_weather(city):
         "peak_wind": max(x["wind"] for x in days),
     }
 
-# ---------- 2. Talk to the AI ----------
+# 2. Talk to the AI
 def ask_groq(messages, **extra):
     r = requests.post(
         GROQ_URL,
@@ -56,69 +56,7 @@ def ask_groq(messages, **extra):
         raise SystemExit("Groq error: " + r.text)
     return r.json()["choices"][0]["message"]
 
-def get_json(prompt, keys):
-    for attempt in range(2):
-        text = ask_groq(
-            [{"role": "system", "content": "Reply with JSON only. No extra text."},
-             {"role": "user", "content": prompt}],
-            temperature=0.2,
-        )["content"].strip()
-        text = text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-        try:
-            data = json.loads(text)
-        except json.JSONDecodeError:
-            print("Bad JSON, trying again")
-            continue
-        if all(k in data for k in keys):
-            return data
-        print("Missing fields, trying again")
-    raise SystemExit("The AI did not return valid JSON")
-
-# ---------- 3. The daily job ----------
-def run_job(dry=False):
-    data = get_weather(CITY)
-    table = "\n".join(
-        f"{x['date']}: high {x['high']}C, low {x['low']}C, max wind {x['wind']} km/h"
-        for x in data["days"]
-    )
-    prompt = (
-        f"Weather for {CITY}, last 5 days:\n{table}\n\n"
-        "Return JSON with exactly these keys: "
-        "trend (warming, cooling or steady), "
-        "wind_risk (low, medium or high), "
-        "advice (one sentence), "
-        "send_alert (true only if something unusual needs attention, otherwise false), "
-        "reason (one sentence). "
-        "Use only the numbers above. Do not invent anything."
-    )
-    result = get_json(prompt, ["trend", "wind_risk", "advice", "send_alert", "reason"])
-    print(result)
-
-    payload = {
-        "city": CITY,
-        "period": data["days"][0]["date"] + " to " + data["days"][-1]["date"],
-        "avg_max": data["avg_high"],
-        "avg_min": data["avg_low"],
-        "peak_wind": data["peak_wind"],
-        "trend": result["trend"],
-        "wind_risk": result["wind_risk"],
-        "advice": result["advice"],
-        "send_alert": result["send_alert"] is True,
-        "reason": result["reason"],
-    }
-
-    if dry:
-        print("Dry run. Nothing was sent to the sheet.")
-        return
-
-    response = requests.post(os.environ["SHEET_URL"], json=payload, timeout=30)
-    print(response.status_code, response.text)
-    if response.text != "OK":
-        raise SystemExit("The sheet script said: " + response.text)
-
-# ---------- 4. The weather agent ----------
-MAX_STEPS = 6   
-
+# 3. The weather agent tools
 def tool_get_weather(city):
     if city not in CITIES:
         return {"error": "city not allowed"}
@@ -167,7 +105,7 @@ def apply_guardrails(d):
     return {"advice": d["advice"].strip(), "reasoning": d["reasoning"].strip(),
             "send_alert": send, "alert_message": message if send else ""}
 
-def run_weather_agent(tools=REAL_TOOLS, max_steps=MAX_STEPS):
+def run_weather_agent(tools=REAL_TOOLS, max_steps=6):
     system = (
         f"You are a weather agent for {CITY}. Use your tools to check the weather and your own recent decisions. "
         "Compare today with the recent days and with your past alerts. "
@@ -226,6 +164,6 @@ def run_agent_job(dry=False):
     if response.text != "OK":
         raise SystemExit("The sheet script said: " + response.text)
 
-# ---------- 5. Execution Entry Point ----------
+# Start here
 if __name__ == "__main__":
     run_agent_job()
