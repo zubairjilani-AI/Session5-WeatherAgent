@@ -15,7 +15,7 @@ os.environ["SHEET_URL"] = "https://arript.google.com/macros/s/AKfycbxeFDbfEjoRyi
 
 def get_weather(city):
     lat, lon = CITIES[city]
-    url = (
+        url = (
         "https://open-meteo.com"
         f"?latitude={lat}&longitude={lon}"
         "&daily=temperature_2m_max,temperature_2m_min,wind_speed_10m_max,precipitation_sum"
@@ -173,4 +173,4 @@ if __name__ == "__main__":
     if mode == "test":
         run_tests()
     else:
-        run_agent_job(dry=True)
+        run_agent_job(dry=False)
