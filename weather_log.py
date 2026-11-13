@@ -397,7 +397,7 @@ def run_tests():
         print(f"{'PASS' if ok else 'FAIL'} | {s['name']} | expected alert {s['expect_alert']}, "
               f"got {decision['send_alert']}, sources {decision['sources']}")
         print("     ", decision["reasoning"])
-        sleep(2)   # be gentle with the free limits
+        sleep(12)   # be gentle with the free limits
     print(f"\n{passed} of {len(SCENARIOS)} passed")
     if passed < len(SCENARIOS):
         raise SystemExit(1)   # a failed test turns the GitHub run red
