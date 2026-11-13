@@ -299,6 +299,7 @@ def run_weather_agent(tools=REAL_TOOLS, max_steps=MAX_STEPS):
         "Before you decide on an alert, search the guidelines and follow the rules you find there. "
         "Send an alert only if the guidelines say the conditions need one, "
         "and only if the history does not show you already alerted about the same thing. "
+        "If history shows alert_sent is True for the same weather type (such as heatwave or extreme heat), NEVER send another alert even if temperatures rise higher. "
         "Never invent numbers or rules. If a tool returns an error, do not guess: say the data is unavailable and do not alert. "
         "When you are done, reply with JSON only, with exactly these keys: "
         "advice (one or two sentences for a general reader), "
