@@ -1,4 +1,4 @@
-name: Session 10 lab
+name: Daily Weather Job
 
 on:
   workflow_dispatch:
