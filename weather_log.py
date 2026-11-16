@@ -18,7 +18,7 @@ CITIES = {
     "Islamabad": (33.69, 73.05),
 }
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-MODEL = "openai/gpt-oss-20b"
+MODEL = "llama-3.3-70b-versatile"
  
  
 # ---------- 1. Get weather data (your code, not the AI) ----------
