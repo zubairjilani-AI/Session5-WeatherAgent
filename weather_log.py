@@ -1,14 +1,17 @@
 import os
 import re
+import ast
 import sys
 import json
 import math
+import tempfile
+import subprocess
 from pathlib import Path
 from time import sleep
 import requests
  
 # ---------- Settings ----------
-CITY = "Karachi"   # set to Karachi
+CITY = "Karachi"   # change to your city (must be in CITIES below)
 CITIES = {
     "Lahore": (31.52, 74.32),
     "Karachi": (24.86, 67.01),
@@ -291,8 +294,40 @@ def apply_guardrails(d):
     return check_sources(decision, valid_sections())      # no valid source, no alert
  
  
-def run_weather_agent(tools=REAL_TOOLS, max_steps=MAX_STEPS):
-    system = (
+REFLECT = True        # turn reflection on or off
+MAX_REVISIONS = 1     # how many times the agent may revise its draft
+ 
+ 
+def evidence_from(messages):
+    # Everything the tools returned during this run
+    return "\n".join(m["content"] for m in messages if m.get("role") == "tool")
+ 
+ 
+def critique(evidence, draft):
+    # A second pass: a strict reviewer checks the draft against the evidence
+    prompt = (
+        "You are a strict reviewer of a weather agent's draft decision.\n\n"
+        f"Evidence the agent collected:\n{evidence}\n\n"
+        f"Draft decision:\n{json.dumps(draft)}\n\n"
+        "Check: (1) every number in the reasoning appears in the evidence, "
+        "(2) an alert is sent only if a guideline in the evidence says the conditions need one, "
+        "(3) the draft does not repeat an alert that the history shows was already sent. "
+        'Reply with JSON only: {"approved": true or false, "problems": ["..."]}'
+    )
+    reply = ask_groq([{"role": "system", "content": "Reply with JSON only."},
+                      {"role": "user", "content": prompt}], temperature=0)["content"]
+    reply = reply.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    try:
+        review = json.loads(reply)
+        if isinstance(review.get("approved"), bool) and isinstance(review.get("problems"), list):
+            return review
+    except (json.JSONDecodeError, AttributeError):
+        pass
+    return {"approved": True, "problems": []}   # a broken review never blocks; the code guardrails still apply
+ 
+ 
+def agent_system():
+    return (
         f"You are a weather agent for {CITY}. Use your tools to check the weather, your own recent decisions "
         "and the safety guidelines. "
         "Compare today with the recent days and with your past alerts. "
@@ -306,17 +341,34 @@ def run_weather_agent(tools=REAL_TOOLS, max_steps=MAX_STEPS):
         "reasoning (two or three sentences explaining your decision with numbers), "
         "send_alert (true or false), "
         "alert_message (a short message, or an empty string if there is no alert), "
-        "sources (a list of the guideline section titles you used, or an empty list)."
+        "sources (a list of the guideline section titles you used, or an empty list). "
+        "Use each tool at most once. Search the guidelines once, then decide. As soon as you have the weather, "
+        "your history and one guideline search, stop calling tools and reply with the JSON."
     )
+ 
+ 
+def run_weather_agent(tools=REAL_TOOLS, max_steps=MAX_STEPS):
+    system = agent_system()
     messages = [{"role": "system", "content": system},
                 {"role": "user", "content": f"Check the weather for {CITY} and decide what to do."}]
     used = []
+    revisions = 0
     for step in range(1, max_steps + 1):
         msg = ask_groq(messages, tools=AGENT_TOOLS, temperature=0.2)
         calls = msg.get("tool_calls")
         if not calls:
             decision = parse_decision(msg.get("content"))
             if decision:
+                if REFLECT and revisions < MAX_REVISIONS:
+                    review = critique(evidence_from(messages), decision)
+                    print("REVIEW:", "approved" if review["approved"] else "; ".join(review["problems"]))
+                    if not review["approved"]:
+                        revisions += 1
+                        messages.append({"role": "assistant", "content": msg.get("content") or ""})
+                        messages.append({"role": "user", "content": "A reviewer found these problems: "
+                                         + "; ".join(review["problems"])
+                                         + ". Fix them and reply with the JSON object only, with the 5 keys."})
+                        continue
                 return decision, used
             messages.append({"role": "assistant", "content": msg.get("content") or ""})
             messages.append({"role": "user", "content": "Reply with the JSON object only, with the 5 keys."})
@@ -339,8 +391,61 @@ def run_weather_agent(tools=REAL_TOOLS, max_steps=MAX_STEPS):
     raise SystemExit("The agent did not finish in time")
  
  
-def run_agent_job(dry=False):
-    decision, used = run_weather_agent()
+# ---------- 6b. Planning: write the plan first, then carry it out ----------
+PLAN_MAX_STEPS = 4
+ 
+ 
+def make_plan(tools):
+    prompt = (
+        f"Task: check the weather for {CITY} and decide whether an alert is needed.\n"
+        "Tools: get_weather(city), get_history(n), search_guidelines(query).\n"
+        'Write a plan as JSON only: {"steps": [{"tool": "...", "args": {}, "why": "..."}]} '
+        f"with 1 to {PLAN_MAX_STEPS} steps. Plan only the information to collect. The decision comes after the steps."
+    )
+    for attempt in range(2):
+        text = ask_groq([{"role": "system", "content": "Reply with JSON only."},
+                         {"role": "user", "content": prompt}], temperature=0.2)["content"]
+        text = text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        try:
+            steps = json.loads(text).get("steps")
+        except (json.JSONDecodeError, AttributeError):
+            steps = None
+        ok = (isinstance(steps, list) and 1 <= len(steps) <= PLAN_MAX_STEPS
+              and all(isinstance(x, dict) and x.get("tool") in tools and isinstance(x.get("args", {}), dict)
+                      for x in steps))
+        if ok:
+            return steps
+        print("The plan was not valid, trying again")
+    raise SystemExit("The agent could not make a valid plan")
+ 
+ 
+def run_planned_agent(tools=REAL_TOOLS):
+    steps = make_plan(tools)                  # 1. the AI writes the plan, your code checks it
+    results, used = [], []
+    for i, step in enumerate(steps, 1):       # 2. your code carries out every step
+        args = step.get("args", {})
+        print("PLAN", i, "->", step["tool"], args, "|", step.get("why", ""))
+        try:
+            result = tools[step["tool"]](**args)
+        except TypeError:
+            result = {"error": "bad arguments"}
+        used.append(step["tool"])
+        results.append({"tool": step["tool"], "result": result})
+    messages = [{"role": "system", "content": agent_system()},
+                {"role": "user", "content": "You collected this by following your plan:\n"
+                 + json.dumps(results) + "\nNow decide. Reply with the JSON object only, with the 5 keys."}]
+    for attempt in range(2):                  # 3. the AI decides, using the results
+        msg = ask_groq(messages, temperature=0.2)
+        decision = parse_decision(msg.get("content"))
+        if decision:
+            return decision, used
+        messages.append({"role": "assistant", "content": msg.get("content") or ""})
+        messages.append({"role": "user", "content": "Reply with the JSON object only, with the 5 keys."})
+    raise SystemExit("The agent did not finish in time")
+ 
+ 
+def run_agent_job(dry=False, runner=None):
+    decision, used = (runner or run_weather_agent)()
     decision = apply_guardrails(decision)
     print("\nADVICE:", decision["advice"])
     print("REASONING:", decision["reasoning"])
@@ -378,19 +483,24 @@ SCENARIOS = [
      "history": [{"time": "yesterday", "city": CITY, "advice": "Extreme heat", "alert_sent": True,
                   "alert_message": "Heatwave: highs above 44 C. Stay indoors at midday."}],
      "expect_alert": False},
+    {"name": "Borderline heat (only one day above 40 C)",
+     "weather": {"city": CITY, "avg_high": 39.4, "avg_low": 27.0, "peak_wind": 12.0,
+                 "daily_highs": [38, 39, 41, 40, 39]},
+     "history": [], "expect_alert": False},
     {"name": "Weather service down",
      "weather": {"error": "service unavailable"},
      "history": [], "expect_alert": False},
 ]
  
  
-def run_tests():
+def run_tests(runner=None):
+    runner = runner or run_weather_agent
     passed = 0
     for s in SCENARIOS:
         tools = {"get_weather": lambda city, s=s: s["weather"],
                  "get_history": lambda n=5, s=s: s["history"],
                  "search_guidelines": tool_search_guidelines}
-        decision = apply_guardrails(run_weather_agent(tools)[0])
+        decision = apply_guardrails(runner(tools)[0])
         ok = decision["send_alert"] == s["expect_alert"]
         if ok and "expect_source" in s:
             ok = s["expect_source"] in decision["sources"]
@@ -398,26 +508,145 @@ def run_tests():
         print(f"{'PASS' if ok else 'FAIL'} | {s['name']} | expected alert {s['expect_alert']}, "
               f"got {decision['send_alert']}, sources {decision['sources']}")
         print("     ", decision["reasoning"])
-        sleep(12)   # be gentle with the free limits
+        sleep(2)   # be gentle with the free limits
     print(f"\n{passed} of {len(SCENARIOS)} passed")
     if passed < len(SCENARIOS):
         raise SystemExit(1)   # a failed test turns the GitHub run red
  
  
-# ---------- Start here ----------
-if __name__ == "__main__":
-    mode = sys.argv[1] if len(sys.argv) > 1 else "job"
-    if mode == "ask":
-        print(run_agent(" ".join(sys.argv[2:])))
-    elif mode == "search":
-        print(search_guidelines(" ".join(sys.argv[2:])))
-    elif mode == "dry":
-        run_job(dry=True)
-    elif mode == "agent":
-        run_agent_job()
-    elif mode == "agent-dry":
-        run_agent_job(dry=True)
-    elif mode == "test":
-        run_tests()
-    else:
-        run_job()
+# ---------- 8. The analyst: the AI writes code, your code runs it safely ----------
+ALLOWED_MODULES = {"math", "statistics", "json", "datetime", "collections", "itertools"}
+BANNED_NAMES = {"open", "exec", "eval", "compile", "__import__", "input", "globals", "locals", "vars",
+                "getattr", "setattr", "delattr", "breakpoint", "exit", "quit", "help", "memoryview"}
+SAFE_BUILTINS = ["abs", "all", "any", "bool", "dict", "divmod", "enumerate", "filter", "float", "int",
+                 "isinstance", "len", "list", "map", "max", "min", "pow", "range", "reversed", "round",
+                 "set", "sorted", "str", "sum", "tuple", "zip",
+                 "Exception", "ValueError", "KeyError", "IndexError", "TypeError", "ZeroDivisionError"]
+MAX_CODE_TRIES = 3        # the Coder gets this many attempts
+REVIEW_CODE = True        # turn the Reviewer on or off
+RUN_SECONDS = 10          # a program that runs longer is killed
+MAX_RESULT_CHARS = 2000   # a bigger result is refused
+ 
+ 
+def get_daily_data(city, days=60):
+    # More history than the 5 days the agent sees: this is what the analyst's code works on
+    lat, lon = CITIES[city]
+    url = (
+        "https://api.open-meteo.com/v1/forecast"
+        f"?latitude={lat}&longitude={lon}"
+        "&daily=temperature_2m_max,temperature_2m_min,wind_speed_10m_max"
+        f"&timezone=auto&past_days={days}&forecast_days=1"
+    )
+    d = requests.get(url, timeout=30).json()["daily"]
+    rows = []
+    for i in range(len(d["time"]) - 1):   # the last day is today and is not finished
+        row = {"date": d["time"][i], "high": d["temperature_2m_max"][i],
+               "low": d["temperature_2m_min"][i], "wind": d["wind_speed_10m_max"][i]}
+        if None not in row.values():
+            rows.append(row)
+    return rows
+ 
+ 
+def describe_data(data):
+    return (f"{len(data)} rows, one per day, from {data[0]['date']} to {data[-1]['date']}. "
+            f"Each row is a dictionary like {json.dumps(data[0])}. The first 3 rows: {json.dumps(data[:3])}")
+ 
+ 
+# --- The safety layers, from the outside in ---
+def check_code(code):
+    # Layer 1: read the code BEFORE running it. Returns a message if something is not allowed.
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as e:
+        return "syntax error: " + str(e)
+    for node in ast.walk(tree):
+        modules = []
+        if isinstance(node, ast.Import):
+            modules = [a.name for a in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            modules = [node.module or ""]
+        for m in modules:
+            if m.split(".")[0] not in ALLOWED_MODULES:
+                return "import not allowed: " + m
+        if isinstance(node, ast.Name) and node.id in BANNED_NAMES:
+            return "name not allowed: " + node.id
+        if isinstance(node, ast.Attribute) and node.attr.startswith("__"):
+            return "attribute not allowed: " + node.attr
+    return None
+ 
+ 
+# Layer 2 runs inside a separate Python process. It gets only a small set of builtins and a guarded import.
+WRAPPER = r"""
+import sys, json, builtins
+ALLOWED = set(json.loads(sys.argv[1]))
+SAFE = json.loads(sys.argv[2])
+payload = json.loads(sys.stdin.read())
+real_import = builtins.__import__
+def safe_import(name, globals=None, locals=None, fromlist=(), level=0):
+    if name.split(".")[0] not in ALLOWED:
+        raise ImportError("import not allowed: " + name)
+    return real_import(name, globals, locals, fromlist, level)
+safe = {k: getattr(builtins, k) for k in SAFE}
+safe["__import__"] = safe_import
+safe["print"] = lambda *a, **k: None
+scope = {"__builtins__": safe, "data": payload["data"]}
+exec(compile(payload["code"], "<analyst>", "exec"), scope)
+sys.stdout.write("@@RESULT@@" + json.dumps(scope.get("result"), default=str))
+"""
+ 
+ 
+def limit_resources():
+    # Layer 3 (Mac and Linux only): the operating system caps the program's CPU time, memory and file size
+    try:
+        import resource
+        for name, value in (("RLIMIT_CPU", RUN_SECONDS), ("RLIMIT_AS", 512 * 1024 * 1024), ("RLIMIT_FSIZE", 1024 * 1024)):
+            try:
+                resource.setrlimit(getattr(resource, name), (value, value))
+            except (ValueError, OSError):
+                pass
+    except ImportError:
+        pass
+ 
+ 
+def run_code(code, data, timeout=RUN_SECONDS):
+    problem = check_code(code)
+    if problem:
+        return {"ok": False, "error": "blocked: " + problem}
+    # Layer 4: an almost empty environment, so the program cannot see GROQ_API_KEY or SHEET_URL.
+    # Only two harmless variables are passed on, because Python itself needs them to start on GitHub and Windows.
+    env = {k: os.environ[k] for k in ("LD_LIBRARY_PATH", "SYSTEMROOT") if k in os.environ}
+    extra = {"preexec_fn": limit_resources} if os.name == "posix" else {}
+    with tempfile.TemporaryDirectory() as tmp:   # an empty folder to run in, deleted afterwards
+        try:
+            p = subprocess.run(
+                [sys.executable, "-I", "-c", WRAPPER, json.dumps(sorted(ALLOWED_MODULES)), json.dumps(SAFE_BUILTINS)],
+                input=json.dumps({"code": code, "data": data}), capture_output=True, text=True,
+                timeout=timeout, cwd=tmp, env=env, **extra)   # Layer 5: a time limit
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "error": f"timed out after {timeout} seconds"}
+    if p.returncode != 0:
+        lines = p.stderr.strip().splitlines()
+        return {"ok": False, "error": (lines[-1] if lines else "the program stopped")[:300]}
+    if "@@RESULT@@" not in p.stdout:
+        return {"ok": False, "error": "the program gave no result"}
+    text = p.stdout.split("@@RESULT@@", 1)[1]
+    if len(text) > MAX_RESULT_CHARS:
+        return {"ok": False, "error": "result too large"}
+    return {"ok": True, "result": json.loads(text)}
+ 
+ 
+# --- The team: three AI roles with different jobs. Your code is the manager that passes work between them. ---
+def loads_reply(text):
+    text = (text or "").strip()
+    text = text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return None
+ 
+ 
+def write_code(question, data, last_code, problems):
+    # Role 1: the Coder
+    system = (
+        "You write short Python to answer a question about weather data. Reply with JSON only: {\"code\": \"...\"}. "
+       
